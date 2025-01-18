@@ -1,29 +1,69 @@
+"""
+Authentication Service Module
+
+This module provides a comprehensive authentication service using MongoDB and JWT tokens.
+It handles user authentication, token management, and security features like account lockout.
+
+Dependencies:
+    - Flask
+    - PyJWT
+    - Argon2
+    - PyMongo
+    - Python 3.8+
+
+Author: Ayman Errarhiche
+Version: 1.0.0
+"""
+
 from flask import g, request, jsonify
-from datetime import datetime, timedelta
+from datetime import datetime
 import jwt
 from functools import wraps
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
-import secrets
 from contextlib import contextmanager
 import logging
+
+from app.config import Config
 from ..db.mongo_handler import MongoHandler
-from bson import ObjectId
 
 logger = logging.getLogger(__name__)
 
 class AuthService:
+    """
+    Authentication service that manages user authentication and token handling.
+
+    This class provides methods for user login, token generation, validation,
+    and management of authentication states including account lockout.
+
+    Attributes:
+        ph (PasswordHasher): Argon2 password hasher instance
+        secret_key (str): Secret key for JWT token generation
+        jwt_expires (timedelta): Token expiration duration
+        max_login_attempts (int): Maximum allowed login attempts before lockout
+        lockout_duration (timedelta): Duration of account lockout
+        database_name (str): Name of the MongoDB database
+    """
+    
     def __init__(self):
+        """Initialize the AuthService with configuration settings."""
         self.ph = PasswordHasher()
-        self.secret_key = secrets.token_hex(32)
-        self.jwt_expires = timedelta(hours=24)
-        self.max_login_attempts = 5
-        self.lockout_duration = timedelta(minutes=15)
+        self.secret_key = Config.SECRET_KEY
+        self.jwt_expires = Config.JWT_EXPIRES
+        self.max_login_attempts = Config.MAX_LOGIN_ATTEMPTS
+        self.lockout_duration = Config.LOCKOUT_DURATION
         self.database_name = 'mongoauth'
 
     @contextmanager
     def _get_db(self):
-        """Context manager for database connections"""
+        """
+        Context manager for database connections.
+
+        Yields:
+            MongoHandler: Connected database handler instance.
+
+        Ensures proper connection handling and cleanup.
+        """
         db = None
         try:
             db = MongoHandler()
@@ -34,11 +74,29 @@ class AuthService:
                 db.close()
 
     def generate_token(self, user_id: str):
+        """
+        Generate a new JWT token for a user.
+
+        Args:
+            user_id (str): The unique identifier of the user.
+
+        Returns:
+            tuple: (str, datetime) Token string and its expiration datetime.
+        """
         expires_at = datetime.utcnow() + self.jwt_expires
         token = jwt.encode({'user_id': user_id, 'exp': expires_at.timestamp()}, self.secret_key, algorithm="HS256")
         return token, expires_at
 
     def refresh_token(self):
+        """
+        Refresh an existing valid token.
+
+        Returns:
+            tuple: (dict, int) JSON response and HTTP status code.
+
+        The method validates the existing token and generates a new one
+        if the current token is valid but close to expiration.
+        """
         with self._get_db() as db:
             try:
                 token = request.headers.get('Authorization', '').split(" ")[1]
@@ -50,7 +108,6 @@ class AuthService:
                 if not user_id:
                     return jsonify({'message': 'Invalid token'}), 401
 
-                # Check if token exists and is not revoked
                 existing_token = db.find_one('auth_tokens', {
                     'token': token,
                     'is_revoked': False
@@ -75,6 +132,14 @@ class AuthService:
                 return jsonify({'message': 'Token refresh failed'}), 500
 
     def validate_token(self):
+        """
+        Validate a token's authenticity and expiration.
+
+        Returns:
+            tuple: (dict, int) JSON response and HTTP status code.
+
+        Checks if the token is valid, not expired, and corresponds to a real user.
+        """
         try:
             token = request.headers.get('Authorization', '').split(" ")[1]
             if not token:
@@ -88,6 +153,15 @@ class AuthService:
             return jsonify({'message': 'Invalid token'}), 401
 
     def token_required(self, f):
+        """
+        Decorator to protect routes that require valid authentication.
+
+        Args:
+            f (function): The route function to be protected.
+
+        Returns:
+            function: Decorated function that checks for valid token before proceeding.
+        """
         @wraps(f)
         def decorated(*args, **kwargs):
             with self._get_db() as db:
@@ -127,7 +201,16 @@ class AuthService:
         return decorated
 
     def _cleanup_user_tokens(self, db: MongoHandler, user_id: str):
-        """Token cleanup process"""
+        """
+        Clean up user's tokens by revoking old ones and removing expired ones.
+
+        Args:
+            db (MongoHandler): Database connection handler.
+            user_id (str): User ID whose tokens need cleanup.
+
+        Raises:
+            Exception: If token cleanup fails.
+        """
         try:
             # Revoke all existing tokens
             db.db['auth_tokens'].update_many(
@@ -150,7 +233,23 @@ class AuthService:
             raise
 
     def login(self, identifier: str, password: str):
-        """Login with either email, phone number, or username"""
+        """
+        Authenticate a user using email, phone number, or username.
+
+        Args:
+            identifier (str): User's email, phone number, or username.
+            password (str): User's password.
+
+        Returns:
+            tuple: (dict, int) JSON response with user data and token if successful,
+                  or error message and appropriate HTTP status code.
+
+        The method handles:
+            - Multiple identifier types (email/phone/username)
+            - Password verification
+            - Account lockout after failed attempts
+            - Token generation and user session management
+        """
         with self._get_db() as db:
             try:
                 if not identifier or not password:
@@ -239,6 +338,17 @@ class AuthService:
                 return jsonify({'message': 'Login failed', 'error': str(e)}), 500
 
     def logout(self, token: str):
+        """
+        Log out a user by revoking their current token.
+
+        Args:
+            token (str): The token to be revoked.
+
+        Returns:
+            tuple: (dict, int) JSON response and HTTP status code.
+
+        Marks the token as revoked in the database, preventing its future use.
+        """
         with self._get_db() as db:
             try:
                 db.db['auth_tokens'].update_one(
